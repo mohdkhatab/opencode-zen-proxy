@@ -26,7 +26,7 @@ app = Flask(__name__)
 # Internal Render Container Port for local daemon
 LOCAL_DAEMON_PORT = 4096
 LOCAL_DAEMON_URL = f"http://127.0.0.1:{LOCAL_DAEMON_PORT}"
-LOCAL_DAEMON_PASSWORD = os.environ.get("OPENCODE_PASSWORD", str(uuid.uuid4()))
+LOCAL_DAEMON_PASSWORD = os.environ.get("OPENCODE_PASSWORD", "render_internal_pass_2026")
 AUTH_HEADER = "Basic " + base64.b64encode(f"opencode:{LOCAL_DAEMON_PASSWORD}".encode()).decode()
 
 SUPPORTED_MODELS = [
@@ -40,11 +40,14 @@ SUPPORTED_MODELS = [
     "nemotron-3.5-lightning-free"
 ]
 
+DAEMON_PROCESS = None
+
 def find_opencode_binary():
     """Finds or installs the official OpenCode CLI binary"""
     candidates = [
-        shutil.which("opencode"),
         os.path.expanduser("~/.opencode/bin/opencode"),
+        shutil.which("opencode"),
+        "/opt/render/.opencode/bin/opencode",
         "/usr/local/bin/opencode",
         "/usr/bin/opencode",
         "./opencode"
@@ -53,8 +56,7 @@ def find_opencode_binary():
         if c and os.path.exists(c) and os.access(c, os.X_OK):
             return c
 
-    # Not found -> Install via official script inside container
-    print("[RENDER SETUP] OpenCode binary not found. Installing official OpenCode CLI...")
+    print("[RENDER SETUP] OpenCode binary not found. Installing official OpenCode CLI...", flush=True)
     try:
         cmd = "curl -fsSL https://opencode.ai/v2/install | bash -s -- --no-modify-path"
         subprocess.run(cmd, shell=True, check=True)
@@ -62,7 +64,7 @@ def find_opencode_binary():
         if os.path.exists(installed):
             return installed
     except Exception as e:
-        print(f"[RENDER SETUP ERROR] Install script failed: {e}")
+        print(f"[RENDER SETUP ERROR] Install script failed: {e}", flush=True)
 
     return None
 
@@ -77,44 +79,57 @@ def is_daemon_running():
 
 def start_internal_daemon():
     """Starts the internal OpenCode daemon inside the Render container"""
+    global DAEMON_PROCESS
     if is_daemon_running():
-        print("[DAEMON] Internal OpenCode daemon is already running.")
-        return
+        print("[DAEMON] Internal OpenCode daemon is already running.", flush=True)
+        return True
 
     binary = find_opencode_binary()
     if not binary:
-        print("[ERROR] Cannot start daemon: opencode binary not found.")
-        return
+        print("[ERROR] Cannot start daemon: opencode binary not found.", flush=True)
+        return False
 
-    print(f"[DAEMON] Starting OpenCode daemon using: {binary} on port {LOCAL_DAEMON_PORT}")
+    print(f"[DAEMON] Starting OpenCode daemon using: {binary} on port {LOCAL_DAEMON_PORT}", flush=True)
     env = os.environ.copy()
     env["OPENCODE_PASSWORD"] = LOCAL_DAEMON_PASSWORD
+    env["OPENCODE_SERVER_PASSWORD"] = LOCAL_DAEMON_PASSWORD
 
+    # IMPORTANT: Do NOT include --auto flag in 'serve' command!
     cmd = [
         binary,
         "serve",
         "--hostname", "127.0.0.1",
-        "--port", str(LOCAL_DAEMON_PORT),
-        "--auto"
+        "--port", str(LOCAL_DAEMON_PORT)
     ]
 
-    subprocess.Popen(
+    DAEMON_PROCESS = subprocess.Popen(
         cmd,
         env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
     )
 
-    # Wait for daemon to become ready
-    for _ in range(15):
+    # Wait up to 10 seconds for daemon to respond
+    for i in range(10):
         time.sleep(1)
+        if DAEMON_PROCESS.poll() is not None:
+            stdout, stderr = DAEMON_PROCESS.communicate()
+            print(f"[DAEMON ERROR] Process exited early (code {DAEMON_PROCESS.returncode}):", flush=True)
+            print(f"STDOUT: {stdout}\nSTDERR: {stderr}", flush=True)
+            return False
         if is_daemon_running():
-            print("[DAEMON] Internal OpenCode daemon is ready and responding!")
-            return
-    print("[WARN] OpenCode daemon start timed out, continuing anyway.")
+            print(f"[DAEMON SUCCESS] OpenCode daemon is active on port {LOCAL_DAEMON_PORT}!", flush=True)
+            return True
 
-# Start internal daemon on worker boot
-start_internal_daemon()
+    print("[WARN] OpenCode daemon startup exceeded timeout.", flush=True)
+    return is_daemon_running()
+
+# Attempt daemon startup at load time
+try:
+    start_internal_daemon()
+except Exception as e:
+    print(f"[BOOT ERROR] {e}", flush=True)
 
 def daemon_request(endpoint, method="GET", data=None):
     """Communicates directly with the internal OpenCode daemon inside Render"""
@@ -172,7 +187,7 @@ def list_models():
 @app.route("/v1/chat/completions", methods=["POST"])
 @app.route("/chat/completions", methods=["POST"])
 def chat_completions():
-    # Ensure daemon is running
+    # If daemon isn't running yet, boot it
     if not is_daemon_running():
         start_internal_daemon()
 
