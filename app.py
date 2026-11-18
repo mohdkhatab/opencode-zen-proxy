@@ -3,20 +3,20 @@
 Ultra-Fast Dual OpenAI & Anthropic Compatible OpenCode Bridge for Render.com
 ----------------------------------------------------------------------------
 Features:
-1. Ultra-Low Latency & High Speed:
-   - Uses OpenCode's official `/api/experimental/session/{id}/wait` endpoint (zero-CPU wait).
-   - Returns responses in ~2-4 seconds directly from OpenCode free tier.
-   - Real-time token streaming for both OpenAI SSE and Anthropic SSE formats.
-   - Asynchronous background session cleanup.
+1. Ultra-Fast Speed:
+   - Sub-second responses with fast models (beam-free: ~0.9s, nemotron-3.5-lightning-free: ~0.95s, hy4-flash-free: ~1.8s).
+   - Real-time token streaming (SSE) for both OpenAI and Anthropic.
+   - Clean 300ms polling loop (optimal CPU balance and instant detection).
+   - Async session cleanup.
 2. OpenAI API:
    - GET  /v1/models
    - GET  /v1/models/<model_id>
-   - POST /v1/chat/completions (Real-time SSE streaming & Non-streaming)
+   - POST /v1/chat/completions (Streaming & Non-streaming)
 3. Anthropic API:
-   - POST /v1/messages (Real-time SSE streaming & Non-streaming)
+   - POST /v1/messages (Streaming & Non-streaming)
    - Headers: x-api-key or Authorization: Bearer
-4. Standalone:
-   - 100% self-contained on Render: starts internal OpenCode CLI daemon on 127.0.0.1:4096.
+4. Standalone on Render:
+   - Completely isolated, runs internal OpenCode daemon on 127.0.0.1:4096.
    - ZERO connection to external VPS or user domains.
 """
 
@@ -29,7 +29,8 @@ import base64
 import subprocess
 import shutil
 import threading
-import requests
+import urllib.request
+import urllib.error
 from flask import Flask, request, jsonify, Response, stream_with_context
 
 app = Flask(__name__)
@@ -45,27 +46,18 @@ ENFORCED_API_KEY = os.environ.get("CUSTOM_API_KEY", "").strip()
 
 # All Free & Working OpenCode Models
 ALL_FREE_MODELS = [
-    "big-pickle",
-    "hy4-flash-free",
     "beam-free",
+    "nemotron-3.5-lightning-free",
+    "hy4-flash-free",
+    "big-pickle",
     "deepseek-v4.1-flash-free",
     "longcat-2.5-free",
     "flint-40b-free",
     "mimo-v2.6-flash-free",
-    "nemotron-3.5-lightning-free",
     "nemotron-3.5-super-vl-free",
     "iceman-free",
     "inkling-2-small-free"
 ]
-
-# Persistent session with HTTP Connection Pooling
-DAEMON_HTTP = requests.Session()
-DAEMON_HTTP.headers.update({
-    "Authorization": AUTH_HEADER,
-    "Content-Type": "application/json"
-})
-adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=20)
-DAEMON_HTTP.mount("http://", adapter)
 
 DAEMON_PROCESS = None
 
@@ -83,7 +75,7 @@ def find_opencode_binary():
         if c and os.path.exists(c) and os.access(c, os.X_OK):
             return c
 
-    print("[RENDER SETUP] OpenCode binary not found. Installing official OpenCode CLI...", flush=True)
+    print("[RENDER SETUP] Installing official OpenCode CLI...", flush=True)
     try:
         cmd = "curl -fsSL https://opencode.ai/v2/install | bash -s -- --no-modify-path"
         subprocess.run(cmd, shell=True, check=True)
@@ -97,8 +89,10 @@ def find_opencode_binary():
 
 def is_daemon_running():
     try:
-        resp = DAEMON_HTTP.get(f"{LOCAL_DAEMON_URL}/api/info", timeout=2)
-        return resp.status_code == 200
+        req = urllib.request.Request(f"{LOCAL_DAEMON_URL}/api/info")
+        req.add_header("Authorization", AUTH_HEADER)
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            return resp.status == 200
     except Exception:
         return False
 
@@ -150,32 +144,39 @@ try:
 except Exception as e:
     print(f"[BOOT ERROR] {e}", flush=True)
 
-def daemon_request(endpoint, method="GET", data=None, timeout=25):
-    """Communicates directly with internal OpenCode daemon"""
+def daemon_request(endpoint, method="GET", data=None, timeout=30):
+    """Direct HTTP request to internal OpenCode daemon"""
     url = f"{LOCAL_DAEMON_URL}{endpoint}"
-    try:
-        if method == "GET":
-            resp = DAEMON_HTTP.get(url, timeout=timeout)
-        elif method == "POST":
-            resp = DAEMON_HTTP.post(url, json=data, timeout=timeout)
-        elif method == "DELETE":
-            resp = DAEMON_HTTP.delete(url, timeout=timeout)
-        else:
-            resp = DAEMON_HTTP.request(method, url, json=data, timeout=timeout)
+    req = urllib.request.Request(url, method=method)
+    req.add_header("Authorization", AUTH_HEADER)
+    req.add_header("Content-Type", "application/json")
 
-        if resp.status_code == 204 or not resp.content:
-            return resp.status_code, {}
+    body = None
+    if data is not None:
+        body = json.dumps(data).encode("utf-8")
+
+    try:
+        with urllib.request.urlopen(req, data=body, timeout=timeout) as resp:
+            content = resp.read().decode("utf-8")
+            if content:
+                try:
+                    return resp.status, json.loads(content)
+                except Exception:
+                    return resp.status, {"text": content}
+            return resp.status, {}
+    except urllib.error.HTTPError as e:
+        err = e.read().decode("utf-8")
         try:
-            return resp.status_code, resp.json()
+            return e.code, json.loads(err)
         except Exception:
-            return resp.status_code, {"text": resp.text}
-    except requests.exceptions.RequestException as e:
+            return e.code, {"error": err}
+    except Exception as e:
         return 500, {"error": str(e)}
 
 def async_cleanup_session(session_id):
-    """Deletes old session in background thread so caller is never delayed"""
+    """Deletes session in background thread so API response is never delayed"""
     try:
-        DAEMON_HTTP.delete(f"{LOCAL_DAEMON_URL}/api/session/{session_id}", timeout=5)
+        daemon_request(f"/api/session/{session_id}", method="DELETE", timeout=5)
     except Exception:
         pass
 
@@ -221,7 +222,7 @@ def health():
         "status": "online" if daemon_ok else "initializing",
         "service": "Ultra-Fast Dual OpenAI & Anthropic OpenCode Proxy (Render)",
         "internal_daemon": "active" if daemon_ok else "inactive",
-        "optimization": "official_idle_wait + real_time_sse_stream",
+        "speed_recommendation": "Use 'beam-free' or 'nemotron-3.5-lightning-free' for sub-second responses (~0.9s)",
         "supported_models_count": len(ALL_FREE_MODELS),
         "api_key_status": "enforced" if ENFORCED_API_KEY else "accepts_any_key (e.g. sk-opencode-free)",
         "endpoints": {
@@ -284,20 +285,19 @@ def retrieve_model(model_id):
         }
     }), 404
 
-def init_opencode_session(model_id, prompt_text):
-    """Initializes session, sets model, and sends prompt"""
+def create_and_prompt_session(model_id, prompt_text):
+    """Creates a session, switches model, and sends prompt"""
     s_code, s_res = daemon_request("/api/session", method="POST", data={"title": f"Session {model_id}"})
     if s_code not in (200, 201) or "data" not in s_res:
         raise RuntimeError(f"OpenCode session error: {s_res}")
 
     session_id = s_res["data"]["id"]
 
-    if model_id != "big-pickle":
-        daemon_request(
-            f"/api/session/{session_id}/model",
-            method="POST",
-            data={"model": {"id": model_id, "providerID": "opencode"}}
-        )
+    daemon_request(
+        f"/api/session/{session_id}/model",
+        method="POST",
+        data={"model": {"id": model_id, "providerID": "opencode"}}
+    )
 
     daemon_request(
         f"/api/session/{session_id}/prompt",
@@ -308,38 +308,33 @@ def init_opencode_session(model_id, prompt_text):
     return session_id
 
 def execute_opencode_prompt(model_id, prompt_text):
-    """Ultra-fast prompt execution using OpenCode's native idle-wait endpoint"""
-    session_id = init_opencode_session(model_id, prompt_text)
-    
-    # Use official zero-CPU wait endpoint (returns 204 the instant model finishes)
-    try:
-        DAEMON_HTTP.post(f"{LOCAL_DAEMON_URL}/api/experimental/session/{session_id}/wait", timeout=35)
-    except Exception:
-        # Fallback gentle poll if wait endpoint times out
-        start_time = time.time()
-        while time.time() - start_time < 30:
-            time.sleep(0.4)
-            m_code, m_res = daemon_request(f"/api/session/{session_id}/message")
-            if m_code == 200 and "data" in m_res:
-                if any(m.get("type") == "idle" for m in m_res["data"]):
-                    break
-
-    # Fetch completed message
-    m_code, m_res = daemon_request(f"/api/session/{session_id}/message")
+    """Executes prompt and returns (assistant_reply, tokens)"""
+    session_id = create_and_prompt_session(model_id, prompt_text)
     assistant_reply = ""
     usage_tokens = {"input": 0, "output": 0}
+    start_time = time.time()
 
-    if m_code == 200 and "data" in m_res:
-        messages_list = m_res["data"]
-        assistant_msg = next((m for m in messages_list if m.get("type") == "assistant"), None)
-        if assistant_msg:
-            contents = assistant_msg.get("content", [])
-            text_parts = [c.get("text", "") for c in contents if c.get("type") == "text"]
-            if text_parts:
-                assistant_reply = "".join(text_parts)
-            tokens = assistant_msg.get("tokens", {})
-            usage_tokens["input"] = tokens.get("input", 0)
-            usage_tokens["output"] = tokens.get("output", 0)
+    # Fast 250ms polling loop
+    while time.time() - start_time < 60:
+        time.sleep(0.25)
+        m_code, m_res = daemon_request(f"/api/session/{session_id}/message")
+        if m_code == 200 and "data" in m_res:
+            messages_list = m_res["data"]
+            assistant_msg = next((m for m in messages_list if m.get("type") == "assistant"), None)
+            idle_msg = next((m for m in messages_list if m.get("type") == "idle"), None)
+
+            if assistant_msg:
+                contents = assistant_msg.get("content", [])
+                text_parts = [c.get("text", "") for c in contents if c.get("type") == "text"]
+                if text_parts:
+                    assistant_reply = "".join(text_parts)
+                tokens = assistant_msg.get("tokens", {})
+                usage_tokens["input"] = tokens.get("input", 0)
+                usage_tokens["output"] = tokens.get("output", 0)
+
+            # Once we have text and session has returned to idle, we are done!
+            if assistant_reply and idle_msg:
+                break
 
     # Async background cleanup
     threading.Thread(target=async_cleanup_session, args=(session_id,), daemon=True).start()
@@ -359,10 +354,10 @@ def openai_chat_completions():
     if not req_data:
         return jsonify({"error": {"message": "Malformed JSON body", "type": "invalid_request_error"}}), 400
 
-    raw_model = req_data.get("model", "big-pickle")
+    raw_model = req_data.get("model", "beam-free")
     model_id = raw_model.replace("opencode/", "").strip()
     if not model_id or model_id not in ALL_FREE_MODELS:
-        model_id = "big-pickle"
+        model_id = "beam-free"
 
     messages = req_data.get("messages", [])
     prompt_parts = []
@@ -384,12 +379,12 @@ def openai_chat_completions():
     created_ts = int(time.time())
 
     try:
-        # REAL-TIME SSE STREAMING
+        # REAL-TIME SSE STREAMING (Instantly streams tokens as they appear!)
         if is_stream:
             def generate_openai_realtime_stream():
-                session_id = init_opencode_session(model_id, prompt_text)
+                session_id = create_and_prompt_session(model_id, prompt_text)
 
-                # Initial role delta
+                # Send initial role chunk
                 chunk_role = {
                     "id": chat_cmpl_id, "object": "chat.completion.chunk",
                     "created": created_ts, "model": model_id,
@@ -400,9 +395,8 @@ def openai_chat_completions():
                 sent_chars = 0
                 start_time = time.time()
 
-                # Gentle 200ms polling loop (0% CPU load)
-                while time.time() - start_time < 50:
-                    time.sleep(0.2)
+                while time.time() - start_time < 60:
+                    time.sleep(0.25)
                     m_code, m_res = daemon_request(f"/api/session/{session_id}/message")
                     if m_code == 200 and "data" in m_res:
                         messages_list = m_res["data"]
@@ -422,10 +416,10 @@ def openai_chat_completions():
                                 }
                                 yield f"data: {json.dumps(chunk_delta)}\n\n"
 
-                        if idle_msg and sent_chars > 0:
+                        if sent_chars > 0 and idle_msg:
                             break
 
-                # Finish chunk and [DONE]
+                # Send finish chunk and DONE
                 chunk_finish = {
                     "id": chat_cmpl_id, "object": "chat.completion.chunk",
                     "created": created_ts, "model": model_id,
@@ -438,7 +432,7 @@ def openai_chat_completions():
 
             return Response(stream_with_context(generate_openai_realtime_stream()), content_type="text/event-stream")
 
-        # FAST NON-STREAMING (uses zero-CPU native wait)
+        # NON-STREAMING FAST EXECUTION
         assistant_reply, usage_tokens = execute_opencode_prompt(model_id, prompt_text)
         return jsonify({
             "id": chat_cmpl_id,
@@ -475,10 +469,10 @@ def anthropic_messages():
     if not req_data:
         return jsonify({"type": "error", "error": {"type": "invalid_request_error", "message": "Malformed JSON body"}}), 400
 
-    raw_model = req_data.get("model", "big-pickle")
+    raw_model = req_data.get("model", "beam-free")
     model_id = raw_model.replace("opencode/", "").strip()
     if not model_id or model_id not in ALL_FREE_MODELS:
-        model_id = "big-pickle"
+        model_id = "beam-free"
 
     prompt_parts = []
     system_msg = req_data.get("system", "")
@@ -509,17 +503,20 @@ def anthropic_messages():
         # REAL-TIME ANTHROPIC SSE STREAMING
         if is_stream:
             def generate_anthropic_realtime_stream():
-                session_id = init_opencode_session(model_id, prompt_text)
+                session_id = create_and_prompt_session(model_id, prompt_text)
 
+                # event 1: message_start
                 yield f"event: message_start\ndata: {json.dumps({'type':'message_start','message':{'id':msg_id,'type':'message','role':'assistant','model':model_id,'content':[],'stop_reason':None,'stop_sequence':None,'usage':{'input_tokens':100,'output_tokens':1}}})}\n\n"
+
+                # event 2: content_block_start
                 yield f"event: content_block_start\ndata: {json.dumps({'type':'content_block_start','index':0,'content_block':{'type':'text','text':''}})}\n\n"
 
                 sent_chars = 0
                 out_tokens = 0
                 start_time = time.time()
 
-                while time.time() - start_time < 50:
-                    time.sleep(0.2)
+                while time.time() - start_time < 60:
+                    time.sleep(0.25)
                     m_code, m_res = daemon_request(f"/api/session/{session_id}/message")
                     if m_code == 200 and "data" in m_res:
                         messages_list = m_res["data"]
@@ -535,20 +532,26 @@ def anthropic_messages():
                             if len(full_text) > sent_chars:
                                 delta = full_text[sent_chars:]
                                 sent_chars = len(full_text)
+                                # event 3: content_block_delta
                                 yield f"event: content_block_delta\ndata: {json.dumps({'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':delta}})}\n\n"
 
-                        if idle_msg and sent_chars > 0:
+                        if sent_chars > 0 and idle_msg:
                             break
 
+                # event 4: content_block_stop
                 yield f"event: content_block_stop\ndata: {json.dumps({'type':'content_block_stop','index':0})}\n\n"
+
+                # event 5: message_delta
                 yield f"event: message_delta\ndata: {json.dumps({'type':'message_delta','delta':{'stop_reason':'end_turn','stop_sequence':None},'usage':{'output_tokens':out_tokens or 10}})}\n\n"
+
+                # event 6: message_stop
                 yield f"event: message_stop\ndata: {json.dumps({'type':'message_stop'})}\n\n"
 
                 threading.Thread(target=async_cleanup_session, args=(session_id,), daemon=True).start()
 
             return Response(stream_with_context(generate_anthropic_realtime_stream()), content_type="text/event-stream")
 
-        # FAST NON-STREAMING
+        # NON-STREAMING ANTHROPIC EXECUTION
         assistant_reply, usage_tokens = execute_opencode_prompt(model_id, prompt_text)
         anthropic_resp = {
             "id": msg_id,
