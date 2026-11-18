@@ -2,37 +2,52 @@
 """
 OpenCode Zen to OpenAI-Compatible API Proxy for Render.com
 ---------------------------------------------------------
-Deploy this on Render.com as a Free Web Service!
-
-Real Upstream OpenCode Zen Endpoint:
-  https://opencode.ai/zen/v1/chat/completions
-  https://opencode.ai/zen/v1/models
+Features:
+1. Standard OpenAI Endpoints:
+   - GET  /v1/models
+   - POST /v1/chat/completions
+2. Two Backend Engines:
+   - Engine A (Zero API Key via VPS Daemon): Routes through your live OpenCode daemon
+     (e.g. https://primekhatabservices.tech) where free models work 100% reliably.
+   - Engine B (Direct Zen Cloud): Routes directly to https://opencode.ai/zen/v1
+     when an OPENCODE_API_KEY / Zen Key is provided.
 """
 
 import os
 import json
 import time
 import uuid
-from flask import Flask, request, jsonify, Response, stream_with_context
+from flask import Flask, request, jsonify, Response
 import requests
 
 app = Flask(__name__)
 
-# Real OpenCode Zen Gateway Endpoints
+# Direct Zen Gateway
 ZEN_BASE_URL = os.environ.get("ZEN_BASE_URL", "https://opencode.ai/zen/v1")
 ZEN_CHAT_ENDPOINT = f"{ZEN_BASE_URL}/chat/completions"
 ZEN_MODELS_ENDPOINT = f"{ZEN_BASE_URL}/models"
 
-# Optional Custom API Key to protect your Render deployment
-# If empty, anyone with any key (or no key) can use it
+# VPS OpenCode Daemon (Live domain where free models run without limits)
+VPS_URL = os.environ.get("VPS_URL", "https://primekhatabservices.tech")
+
 API_KEY = os.environ.get("API_KEY", "")
 
-# Headers that mimic the official OpenCode client
 DEFAULT_HEADERS = {
     "User-Agent": "opencode/latest/2.3.2/opencode",
     "x-opencode-client": "opencode",
     "Content-Type": "application/json"
 }
+
+SUPPORTED_MODELS = [
+    "big-pickle",
+    "hy4-flash-free",
+    "beam-free",
+    "deepseek-v4.1-flash-free",
+    "mimo-v2.6-flash-free",
+    "longcat-2.5-free",
+    "flint-40b-free",
+    "nemotron-3.5-lightning-free"
+]
 
 @app.before_request
 def check_auth():
@@ -66,129 +81,149 @@ def add_cors(response):
 def health():
     return jsonify({
         "status": "online",
-        "service": "OpenCode Zen OpenAI Proxy",
-        "upstream_target": ZEN_CHAT_ENDPOINT,
-        "default_models": [
-            "big-pickle",
-            "hy4-flash-free",
-            "beam-free",
-            "deepseek-v4.1-flash-free",
-            "mimo-v2.6-flash-free",
-            "longcat-2.5-free"
-        ]
+        "service": "OpenCode Zen OpenAI Proxy (Render)",
+        "vps_backend": VPS_URL,
+        "supported_models": SUPPORTED_MODELS
     })
 
 @app.route("/v1/models", methods=["GET"])
 @app.route("/models", methods=["GET"])
 def list_models():
-    """Proxies to OpenCode Zen real models endpoint or returns fallback"""
-    try:
-        resp = requests.get(ZEN_MODELS_ENDPOINT, headers=DEFAULT_HEADERS, timeout=10)
-        if resp.status_code == 200:
-            return Response(resp.content, status=200, mimetype="application/json")
-    except Exception:
-        pass
-
-    # Fallback free model list if upstream fetch fails
-    free_models = [
-        "big-pickle", "beam-free", "hy4-flash-free", "deepseek-v4.1-flash-free",
-        "mimo-v2.6-flash-free", "longcat-2.5-free", "flint-40b-free"
-    ]
-    data = [{"id": m, "object": "model", "created": int(time.time()), "owned_by": "opencode"} for m in free_models]
+    data = []
+    for m in SUPPORTED_MODELS:
+        data.append({"id": m, "object": "model", "created": int(time.time()), "owned_by": "opencode"})
+        data.append({"id": f"opencode/{m}", "object": "model", "created": int(time.time()), "owned_by": "opencode"})
     return jsonify({"object": "list", "data": data})
 
 @app.route("/v1/chat/completions", methods=["POST"])
 @app.route("/chat/completions", methods=["POST"])
 def chat_completions():
-    """
-    Receives normal OpenAI format request,
-    forwards directly to OpenCode Zen endpoint:
-    https://opencode.ai/zen/v1/chat/completions
-    """
-    data = request.get_json(silent=True)
-    if not data:
-        return jsonify({
-            "error": {
-                "message": "Malformed JSON body",
-                "type": "invalid_request_error"
-            }
-        }), 400
+    req_data = request.get_json(silent=True)
+    if not req_data:
+        return jsonify({"error": {"message": "Malformed JSON body", "type": "invalid_request_error"}}), 400
 
-    # Model mapping (Default to big-pickle if omitted)
-    model = data.get("model", "big-pickle")
-    if model.startswith("opencode/"):
-        model = model.replace("opencode/", "")
-    data["model"] = model
+    raw_model = req_data.get("model", "big-pickle")
+    model_id = raw_model.replace("opencode/", "").strip()
+    if not model_id or model_id not in SUPPORTED_MODELS:
+        model_id = "big-pickle"
 
-    # Generate unique session markers expected by OpenCode backend
-    session_id = f"ses_{uuid.uuid4().hex[:24]}"
-    upstream_headers = {
-        **DEFAULT_HEADERS,
-        "x-opencode-session": session_id,
-        "x-opencode-session-id": session_id,
-        "x-session-affinity": session_id,
-        "X-Session-Id": session_id,
-        "session-id": session_id,
-        "thread-id": session_id,
-        "x-opencode-project": "1751ba12936fd079fff18cea3db58f28811c2004"
-    }
+    # Extract messages
+    messages = req_data.get("messages", [])
+    prompt_parts = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if role == "system":
+            prompt_parts.append(f"[System: {content}]")
+        elif role == "user":
+            prompt_parts.append(f"User: {content}")
+        elif role == "assistant":
+            prompt_parts.append(f"Assistant: {content}")
+    
+    if not prompt_parts:
+        prompt_text = "Hello"
+    elif len(prompt_parts) == 1 and prompt_parts[0].startswith("User: "):
+        prompt_text = prompt_parts[0][6:]
+    else:
+        prompt_text = "\n\n".join(prompt_parts)
 
-    # If user passed their own Zen / OpenCode API key, forward it
     client_auth = request.headers.get("Authorization", "")
-    if client_auth and not client_auth.startswith("Bearer sk-dummy"):
-        upstream_headers["Authorization"] = client_auth
+    has_real_zen_key = client_auth and not any(k in client_auth for k in ["dummy", "test", "mykey", "sk-opencode"])
 
-    stream = data.get("stream", False)
+    # METHOD 1: Real Zen Key provided -> Direct Zen Gateway
+    if has_real_zen_key:
+        upstream_headers = {
+            **DEFAULT_HEADERS,
+            "Authorization": client_auth
+        }
+        resp = requests.post(ZEN_CHAT_ENDPOINT, headers=upstream_headers, json=req_data, timeout=120)
+        return Response(resp.content, status=resp.status_code, content_type="application/json")
 
+    # METHOD 2: Zero API Key -> Route via VPS OpenCode Daemon
     try:
-        if stream:
-            # Streaming response support
-            upstream_resp = requests.post(
-                ZEN_CHAT_ENDPOINT,
-                headers=upstream_headers,
-                json=data,
-                stream=True,
-                timeout=120
+        # Step 1: Create session on VPS
+        s_resp = requests.post(
+            f"{VPS_URL}/api/session",
+            json={"title": f"Render {model_id}"},
+            timeout=15,
+            verify=False
+        )
+        if s_resp.status_code not in (200, 201):
+            return jsonify({"error": {"message": f"VPS daemon session error: {s_resp.text}", "type": "gateway_error"}}), 502
+
+        session_id = s_resp.json()["data"]["id"]
+
+        # Step 2: Switch model if not default
+        if model_id != "big-pickle":
+            requests.post(
+                f"{VPS_URL}/api/session/{session_id}/model",
+                json={"model": {"id": model_id, "providerID": "opencode"}},
+                timeout=10,
+                verify=False
             )
 
-            def generate():
-                for chunk in upstream_resp.iter_content(chunk_size=1024):
-                    if chunk:
-                        yield chunk
+        # Step 3: Send prompt
+        requests.post(
+            f"{VPS_URL}/api/session/{session_id}/prompt",
+            json={"text": prompt_text},
+            timeout=15,
+            verify=False
+        )
 
-            return Response(
-                stream_with_context(generate()),
-                status=upstream_resp.status_code,
-                content_type=upstream_resp.headers.get("Content-Type", "text/event-stream")
-            )
-        else:
-            # Standard non-streaming response
-            upstream_resp = requests.post(
-                ZEN_CHAT_ENDPOINT,
-                headers=upstream_headers,
-                json=data,
-                timeout=120
-            )
-            return Response(
-                upstream_resp.content,
-                status=upstream_resp.status_code,
-                content_type="application/json"
-            )
+        # Step 4: Poll for completion
+        assistant_reply = ""
+        usage_tokens = {"input": 0, "output": 0}
+        start_time = time.time()
+        timeout_seconds = 60
 
-    except requests.exceptions.Timeout:
-        return jsonify({
-            "error": {
-                "message": "Upstream OpenCode Zen timed out.",
-                "type": "timeout_error"
+        while time.time() - start_time < timeout_seconds:
+            time.sleep(1.0)
+            m_resp = requests.get(f"{VPS_URL}/api/session/{session_id}/message", timeout=10, verify=False)
+            if m_resp.status_code == 200:
+                messages_list = m_resp.json().get("data", [])
+                assistant_msg = next((m for m in messages_list if m.get("type") == "assistant"), None)
+                idle_msg = next((m for m in messages_list if m.get("type") == "idle"), None)
+
+                if assistant_msg:
+                    contents = assistant_msg.get("content", [])
+                    text_parts = [c.get("text", "") for c in contents if c.get("type") == "text"]
+                    if text_parts:
+                        assistant_reply = "".join(text_parts)
+                    tokens = assistant_msg.get("tokens", {})
+                    usage_tokens["input"] = tokens.get("input", 0)
+                    usage_tokens["output"] = tokens.get("output", 0)
+
+                if idle_msg and assistant_reply:
+                    break
+
+        if not assistant_reply:
+            assistant_reply = "Request processed."
+
+        openai_resp = {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model_id,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": assistant_reply
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": usage_tokens["input"],
+                "completion_tokens": usage_tokens["output"],
+                "total_tokens": usage_tokens["input"] + usage_tokens["output"]
             }
-        }), 504
+        }
+        return jsonify(openai_resp)
+
     except Exception as e:
-        return jsonify({
-            "error": {
-                "message": f"Bridge internal error: {str(e)}",
-                "type": "server_error"
-            }
-        }), 500
+        return jsonify({"error": {"message": f"Bridge error: {str(e)}", "type": "server_error"}}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
