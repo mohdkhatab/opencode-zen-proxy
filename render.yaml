@@ -1,12 +1,7 @@
 services:
   - type: web
-    name: opencode-zen-bridge
+    name: opencode-zen-proxy
     env: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt && (curl -fsSL https://opencode.ai/v2/install | bash -s -- --no-modify-path || true)
     startCommand: gunicorn app:app
     plan: free
-    envVars:
-      - key: ZEN_BASE_URL
-        value: https://opencode.ai/zen/v1
-      - key: API_KEY
-        value: "" # Optional: Add your custom secret key here if you want to protect your endpoint

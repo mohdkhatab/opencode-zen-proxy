@@ -1,42 +1,33 @@
 #!/usr/bin/env python3
 """
-OpenCode Zen to OpenAI-Compatible API Proxy for Render.com
----------------------------------------------------------
-Features:
-1. Standard OpenAI Endpoints:
-   - GET  /v1/models
-   - POST /v1/chat/completions
-2. Two Backend Engines:
-   - Engine A (Zero API Key via VPS Daemon): Routes through your live OpenCode daemon
-     (e.g. https://primekhatabservices.tech) where free models work 100% reliably.
-   - Engine B (Direct Zen Cloud): Routes directly to https://opencode.ai/zen/v1
-     when an OPENCODE_API_KEY / Zen Key is provided.
+Self-Contained OpenCode OpenAI Bridge for Render.com
+----------------------------------------------------
+100% Standalone on Render:
+- Automatically installs OpenCode CLI inside the Render container.
+- Starts an internal OpenCode daemon (127.0.0.1:4096) inside Render.
+- Translates incoming standard OpenAI requests to the internal OpenCode daemon.
+- Completely isolated: ZERO connection to any external VPS or domain.
 """
 
 import os
-import json
+import sys
 import time
+import json
 import uuid
-from flask import Flask, request, jsonify, Response
-import requests
+import base64
+import subprocess
+import shutil
+import urllib.request
+import urllib.error
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# Direct Zen Gateway
-ZEN_BASE_URL = os.environ.get("ZEN_BASE_URL", "https://opencode.ai/zen/v1")
-ZEN_CHAT_ENDPOINT = f"{ZEN_BASE_URL}/chat/completions"
-ZEN_MODELS_ENDPOINT = f"{ZEN_BASE_URL}/models"
-
-# VPS OpenCode Daemon (Live domain where free models run without limits)
-VPS_URL = os.environ.get("VPS_URL", "https://primekhatabservices.tech")
-
-API_KEY = os.environ.get("API_KEY", "")
-
-DEFAULT_HEADERS = {
-    "User-Agent": "opencode/latest/2.3.2/opencode",
-    "x-opencode-client": "opencode",
-    "Content-Type": "application/json"
-}
+# Internal Render Container Port for local daemon
+LOCAL_DAEMON_PORT = 4096
+LOCAL_DAEMON_URL = f"http://127.0.0.1:{LOCAL_DAEMON_PORT}"
+LOCAL_DAEMON_PASSWORD = os.environ.get("OPENCODE_PASSWORD", str(uuid.uuid4()))
+AUTH_HEADER = "Basic " + base64.b64encode(f"opencode:{LOCAL_DAEMON_PASSWORD}".encode()).decode()
 
 SUPPORTED_MODELS = [
     "big-pickle",
@@ -49,25 +40,107 @@ SUPPORTED_MODELS = [
     "nemotron-3.5-lightning-free"
 ]
 
-@app.before_request
-def check_auth():
-    if request.method == "OPTIONS":
+def find_opencode_binary():
+    """Finds or installs the official OpenCode CLI binary"""
+    candidates = [
+        shutil.which("opencode"),
+        os.path.expanduser("~/.opencode/bin/opencode"),
+        "/usr/local/bin/opencode",
+        "/usr/bin/opencode",
+        "./opencode"
+    ]
+    for c in candidates:
+        if c and os.path.exists(c) and os.access(c, os.X_OK):
+            return c
+
+    # Not found -> Install via official script inside container
+    print("[RENDER SETUP] OpenCode binary not found. Installing official OpenCode CLI...")
+    try:
+        cmd = "curl -fsSL https://opencode.ai/v2/install | bash -s -- --no-modify-path"
+        subprocess.run(cmd, shell=True, check=True)
+        installed = os.path.expanduser("~/.opencode/bin/opencode")
+        if os.path.exists(installed):
+            return installed
+    except Exception as e:
+        print(f"[RENDER SETUP ERROR] Install script failed: {e}")
+
+    return None
+
+def is_daemon_running():
+    try:
+        req = urllib.request.Request(f"{LOCAL_DAEMON_URL}/api/info")
+        req.add_header("Authorization", AUTH_HEADER)
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+def start_internal_daemon():
+    """Starts the internal OpenCode daemon inside the Render container"""
+    if is_daemon_running():
+        print("[DAEMON] Internal OpenCode daemon is already running.")
         return
-    if request.path in ["/", "/health"]:
+
+    binary = find_opencode_binary()
+    if not binary:
+        print("[ERROR] Cannot start daemon: opencode binary not found.")
         return
-    if API_KEY:
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:].strip()
-            if token == API_KEY:
-                return
-        return jsonify({
-            "error": {
-                "message": "Invalid API key provided. Set Authorization: Bearer <API_KEY>",
-                "type": "invalid_request_error",
-                "code": "invalid_api_key"
-            }
-        }), 401
+
+    print(f"[DAEMON] Starting OpenCode daemon using: {binary} on port {LOCAL_DAEMON_PORT}")
+    env = os.environ.copy()
+    env["OPENCODE_PASSWORD"] = LOCAL_DAEMON_PASSWORD
+
+    cmd = [
+        binary,
+        "serve",
+        "--hostname", "127.0.0.1",
+        "--port", str(LOCAL_DAEMON_PORT),
+        "--auto"
+    ]
+
+    subprocess.Popen(
+        cmd,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+
+    # Wait for daemon to become ready
+    for _ in range(15):
+        time.sleep(1)
+        if is_daemon_running():
+            print("[DAEMON] Internal OpenCode daemon is ready and responding!")
+            return
+    print("[WARN] OpenCode daemon start timed out, continuing anyway.")
+
+# Start internal daemon on worker boot
+start_internal_daemon()
+
+def daemon_request(endpoint, method="GET", data=None):
+    """Communicates directly with the internal OpenCode daemon inside Render"""
+    url = f"{LOCAL_DAEMON_URL}{endpoint}"
+    req = urllib.request.Request(url, method=method)
+    req.add_header("Authorization", AUTH_HEADER)
+    req.add_header("Content-Type", "application/json")
+
+    body = None
+    if data is not None:
+        body = json.dumps(data).encode("utf-8")
+
+    try:
+        with urllib.request.urlopen(req, data=body, timeout=60) as resp:
+            content = resp.read().decode("utf-8")
+            if content:
+                return resp.status, json.loads(content)
+            return resp.status, {}
+    except urllib.error.HTTPError as e:
+        err = e.read().decode("utf-8")
+        try:
+            return e.code, json.loads(err)
+        except Exception:
+            return e.code, {"error": err}
+    except Exception as e:
+        return 500, {"error": str(e)}
 
 @app.after_request
 def add_cors(response):
@@ -79,10 +152,11 @@ def add_cors(response):
 @app.route("/", methods=["GET"])
 @app.route("/health", methods=["GET"])
 def health():
+    daemon_ok = is_daemon_running()
     return jsonify({
-        "status": "online",
-        "service": "OpenCode Zen OpenAI Proxy (Render)",
-        "vps_backend": VPS_URL,
+        "status": "online" if daemon_ok else "initializing",
+        "service": "Standalone Render OpenCode Proxy",
+        "internal_daemon": "active" if daemon_ok else "inactive",
         "supported_models": SUPPORTED_MODELS
     })
 
@@ -98,6 +172,10 @@ def list_models():
 @app.route("/v1/chat/completions", methods=["POST"])
 @app.route("/chat/completions", methods=["POST"])
 def chat_completions():
+    # Ensure daemon is running
+    if not is_daemon_running():
+        start_internal_daemon()
+
     req_data = request.get_json(silent=True)
     if not req_data:
         return jsonify({"error": {"message": "Malformed JSON body", "type": "invalid_request_error"}}), 400
@@ -107,7 +185,6 @@ def chat_completions():
     if not model_id or model_id not in SUPPORTED_MODELS:
         model_id = "big-pickle"
 
-    # Extract messages
     messages = req_data.get("messages", [])
     prompt_parts = []
     for msg in messages:
@@ -119,7 +196,7 @@ def chat_completions():
             prompt_parts.append(f"User: {content}")
         elif role == "assistant":
             prompt_parts.append(f"Assistant: {content}")
-    
+
     if not prompt_parts:
         prompt_text = "Hello"
     elif len(prompt_parts) == 1 and prompt_parts[0].startswith("User: "):
@@ -127,60 +204,40 @@ def chat_completions():
     else:
         prompt_text = "\n\n".join(prompt_parts)
 
-    client_auth = request.headers.get("Authorization", "")
-    has_real_zen_key = client_auth and not any(k in client_auth for k in ["dummy", "test", "mykey", "sk-opencode"])
-
-    # METHOD 1: Real Zen Key provided -> Direct Zen Gateway
-    if has_real_zen_key:
-        upstream_headers = {
-            **DEFAULT_HEADERS,
-            "Authorization": client_auth
-        }
-        resp = requests.post(ZEN_CHAT_ENDPOINT, headers=upstream_headers, json=req_data, timeout=120)
-        return Response(resp.content, status=resp.status_code, content_type="application/json")
-
-    # METHOD 2: Zero API Key -> Route via VPS OpenCode Daemon
     try:
-        # Step 1: Create session on VPS
-        s_resp = requests.post(
-            f"{VPS_URL}/api/session",
-            json={"title": f"Render {model_id}"},
-            timeout=15,
-            verify=False
-        )
-        if s_resp.status_code not in (200, 201):
-            return jsonify({"error": {"message": f"VPS daemon session error: {s_resp.text}", "type": "gateway_error"}}), 502
+        # Step 1: Create session on internal daemon
+        s_code, s_res = daemon_request("/api/session", method="POST", data={"title": f"Render {model_id}"})
+        if s_code not in (200, 201) or "data" not in s_res:
+            return jsonify({"error": {"message": f"Internal daemon session error: {s_res}", "type": "gateway_error"}}), 502
 
-        session_id = s_resp.json()["data"]["id"]
+        session_id = s_res["data"]["id"]
 
-        # Step 2: Switch model if not default
+        # Step 2: Switch model
         if model_id != "big-pickle":
-            requests.post(
-                f"{VPS_URL}/api/session/{session_id}/model",
-                json={"model": {"id": model_id, "providerID": "opencode"}},
-                timeout=10,
-                verify=False
+            daemon_request(
+                f"/api/session/{session_id}/model",
+                method="POST",
+                data={"model": {"id": model_id, "providerID": "opencode"}}
             )
 
         # Step 3: Send prompt
-        requests.post(
-            f"{VPS_URL}/api/session/{session_id}/prompt",
-            json={"text": prompt_text},
-            timeout=15,
-            verify=False
+        daemon_request(
+            f"/api/session/{session_id}/prompt",
+            method="POST",
+            data={"text": prompt_text}
         )
 
-        # Step 4: Poll for completion
+        # Step 4: Poll internal daemon for assistant reply
         assistant_reply = ""
         usage_tokens = {"input": 0, "output": 0}
         start_time = time.time()
-        timeout_seconds = 60
+        timeout_seconds = 75
 
         while time.time() - start_time < timeout_seconds:
             time.sleep(1.0)
-            m_resp = requests.get(f"{VPS_URL}/api/session/{session_id}/message", timeout=10, verify=False)
-            if m_resp.status_code == 200:
-                messages_list = m_resp.json().get("data", [])
+            m_code, m_res = daemon_request(f"/api/session/{session_id}/message")
+            if m_code == 200 and "data" in m_res:
+                messages_list = m_res["data"]
                 assistant_msg = next((m for m in messages_list if m.get("type") == "assistant"), None)
                 idle_msg = next((m for m in messages_list if m.get("type") == "idle"), None)
 
@@ -197,7 +254,7 @@ def chat_completions():
                     break
 
         if not assistant_reply:
-            assistant_reply = "Request processed."
+            assistant_reply = "I completed the request."
 
         openai_resp = {
             "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
